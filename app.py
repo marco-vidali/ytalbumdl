@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from io import BytesIO
 from PIL import Image
@@ -8,7 +9,6 @@ import yt_dlp
 
 # ---------------- CONFIG ----------------
 DOWNLOADS_FOLDER = "Downloads"
-# Assicurati di avere il cookies.txt esportato da YouTube nello stesso folder dello script
 COOKIES_FILE = os.path.join(os.path.abspath(os.path.dirname(__file__)), "cookies.txt")
 # ---------------------------------------
 
@@ -18,8 +18,27 @@ def sanitize_filename(name):
         return ''
     return "".join(c for c in name if c not in r'<>:"/\\|?*').strip()
 
+def clean_song_title(title):
+    """Extract the song name from common YouTube title formats like 'Artist - Song (Official Video)'."""
+    if not title:
+        return ''
+
+    # Try to capture the part after '-' and before '(', '[', or end of line
+    match = re.search(r'-(.*?)(?:\(|\[|$)', title)
+    if match:
+        cleaned = match.group(1)
+    else:
+        # fallback: just take before '(' or '[' if no '-'
+        cleaned = re.split(r'[\(\[]', title)[0]
+
+    # remove extra descriptors (official, lyrics, etc.)
+    cleaned = re.sub(r'\b(official|video|music|lyrics|audio|hd|mv|4k)\b', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'[-–_|]+', ' ', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned.title()
+
 def download_audio(video_url, output_path):
-    """Download video as MP3 using cookies.txt."""
+    """Download video as MP3."""
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_path,
@@ -31,12 +50,13 @@ def download_audio(video_url, output_path):
             'preferredquality': '192',
         }],
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([video_url])
 
 def download_and_crop_thumbnail(thumbnails):
     """Download thumbnail, crop to square, and return image bytes."""
-    url = thumbnails[-1]['url']  # highest resolution
+    url = thumbnails[-1]['url']
     resp = requests.get(url, timeout=15)
     img = Image.open(BytesIO(resp.content)).convert("RGB")
 
@@ -76,8 +96,13 @@ def main():
 
     # Extract playlist info
     ydl_opts = {'quiet': True, 'extract_flat': True, 'cookiefile': COOKIES_FILE}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        playlist_info = ydl.extract_info(playlist_url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            playlist_info = ydl.extract_info(playlist_url, download=False)
+    except Exception:
+        print("Warning: unable to load cookies, continuing without them.")
+        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
+            playlist_info = ydl.extract_info(playlist_url, download=False)
 
     album_title = sanitize_filename(playlist_info.get('title', 'Unknown Album'))
     album_folder = os.path.join(DOWNLOADS_FOLDER, album_title)
@@ -90,13 +115,9 @@ def main():
     default_year = upload_date[:4]
     year = input(f"Enter year [{default_year}]: ").strip() or default_year
 
-    if playlist_info.get('_type') == 'playlist':
-        entries = playlist_info.get('entries', [])
-    else:
-        entries = [playlist_info]
+    entries = playlist_info.get('entries', [])
     entries.sort(key=lambda x: x.get('playlist_index', 0))
 
-    # Show tracks and ask for cover
     print("\nTracks:")
     for idx, entry in enumerate(entries, start=1):
         print(f"{idx}. {entry.get('title')}")
@@ -104,22 +125,37 @@ def main():
     cover_index = int(input("\nChoose track index to use as album cover: ")) - 1
     cover_track = entries[cover_index]
 
-    # Download cover thumbnail
+    # Download the chosen track's thumbnail
     with yt_dlp.YoutubeDL({'quiet': True, 'cookiefile': COOKIES_FILE}) as ydl:
         video_info = ydl.extract_info(cover_track['url'], download=False)
     thumbnails = video_info.get('thumbnails', [])
     album_cover_bytes = download_and_crop_thumbnail(thumbnails)
 
-    # Download all tracks
     for idx, entry in enumerate(entries, start=1):
-        song_title = sanitize_filename(entry.get('title', f"Track {idx}"))
+        raw_title = entry.get('title', f"Track {idx}")
+        song_title = sanitize_filename(clean_song_title(raw_title))
         video_url = entry['url']
 
         filename = f"{idx:02d} - {song_title}.%(ext)s"
         output_path = os.path.join(album_folder, filename)
 
         print(f"\nDownloading: {song_title}")
-        download_audio(video_url, output_path)
+        try:
+            download_audio(video_url, output_path)
+        except Exception as e:
+            print(f"Retrying without cookies... ({e})")
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': output_path,
+                'quiet': True,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
 
         mp3_path = os.path.join(album_folder, f"{idx:02d} - {song_title}.mp3")
         print(f"Embedding cover and tags: {song_title}")
